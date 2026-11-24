@@ -32,6 +32,12 @@ from homeassistant.helpers.dispatcher import (
 )
 import homeassistant.util.color as color_util
 
+from .bulbcam import (
+    BULB_CAM_MODEL,
+    fetch_raw_properties,
+    log_property_changes,
+    run_action_checked,
+)
 from .const import (
     BULB_LOCAL_CONTROL,
     CAMERA_UPDATED,
@@ -71,7 +77,7 @@ async def async_setup_entry(
     ]
 
     for camera in await camera_service.get_cameras():
-        if camera.product_model == "HL_BC":
+        if camera.product_model == BULB_CAM_MODEL:
             # Wyze Bulb Cam has integrated light
             lights.append(WyzeCamerafloodlight(camera, camera_service, "bulbcam"))
         elif (
@@ -390,12 +396,28 @@ class WyzeCamerafloodlight(LightEntity):
         self._service = camera_service
         self._light_type = light_type
         self._attr_unique_id = f"{self._device.mac}-{self._light_type}"
+        self._raw_properties: dict[str, tuple[str, int]] | None = None
+        self._property_probe_running = False
+
+    async def _send_light_command(self, turn_on: bool) -> None:
+        """Send the on/off command for this camera's light."""
+        if self._device.product_model == BULB_CAM_MODEL:
+            # wyzeapy ignores run_action's data.result, so check it here.
+            await run_action_checked(
+                self._service,
+                self._device,
+                "floodlight_on" if turn_on else "floodlight_off",
+            )
+        elif turn_on:
+            await self._service.floodlight_on(self._device)
+        else:
+            await self._service.floodlight_off(self._device)
 
     @token_exception_handler
     async def async_turn_on(self, **kwargs) -> None:
         """Turn the floodlight on."""
         try:
-            await self._service.floodlight_on(self._device)
+            await self._send_light_command(True)
         except (AccessTokenError, ParameterError, UnknownApiError) as err:
             raise HomeAssistantError(f"Wyze returned an error: {err.args}") from err
         except ClientConnectionError as err:
@@ -411,7 +433,7 @@ class WyzeCamerafloodlight(LightEntity):
     async def async_turn_off(self, **kwargs):
         """Turn the floodlight off."""
         try:
-            await self._service.floodlight_off(self._device)
+            await self._send_light_command(False)
         except (AccessTokenError, ParameterError, UnknownApiError) as err:
             raise HomeAssistantError(f"Wyze returned an error: {err.args}") from err
         except ClientConnectionError as err:
@@ -465,6 +487,25 @@ class WyzeCamerafloodlight(LightEntity):
         """Update the camera object whenever there is an update."""
         self._device = camera
         self.async_write_ha_state()
+        if (
+            self._device.product_model == BULB_CAM_MODEL
+            and _LOGGER.isEnabledFor(logging.DEBUG)
+            and not self._property_probe_running
+        ):
+            self._property_probe_running = True
+            self.hass.async_create_task(self._probe_properties())
+
+    async def _probe_properties(self) -> None:
+        """Log the Bulb Cam's raw properties to find the one tracking the light."""
+        try:
+            current = await fetch_raw_properties(self._service, self._device)
+        except Exception as err:  # noqa: BLE001 - diagnostics must never break updates
+            _LOGGER.debug("Bulb Cam property probe failed: %s", err)
+        else:
+            log_property_changes(self._device, self._raw_properties, current)
+            self._raw_properties = current
+        finally:
+            self._property_probe_running = False
 
     async def async_added_to_hass(self) -> None:
         """Add listener on startup."""
@@ -495,4 +536,4 @@ class WyzeCamerafloodlight(LightEntity):
     @property
     def supported_color_modes(self):
         """Return the supported color mode."""
-        return ColorMode.ONOFF
+        return {ColorMode.ONOFF}
