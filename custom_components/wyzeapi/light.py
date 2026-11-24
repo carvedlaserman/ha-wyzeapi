@@ -36,7 +36,7 @@ from .bulbcam import (
     BULB_CAM_MODEL,
     fetch_raw_properties,
     log_property_changes,
-    run_action_checked,
+    set_light,
 )
 from .const import (
     BULB_LOCAL_CONTROL,
@@ -398,16 +398,19 @@ class WyzeCamerafloodlight(LightEntity):
         self._attr_unique_id = f"{self._device.mac}-{self._light_type}"
         self._raw_properties: dict[str, tuple[str, int]] | None = None
         self._property_probe_running = False
+        # Bulb Cam: the control method that last switched the light.
+        self._light_method: str | None = None
 
     async def _send_light_command(self, turn_on: bool) -> None:
         """Send the on/off command for this camera's light."""
         if self._device.product_model == BULB_CAM_MODEL:
-            # wyzeapy ignores run_action's data.result, so check it here.
-            await run_action_checked(
-                self._service,
-                self._device,
-                "floodlight_on" if turn_on else "floodlight_off",
+            # Wyze rejects wyzeapy's run_action path for the Bulb Cam, so try
+            # each control method and confirm the result via P1056.
+            method = await set_light(
+                self._service, self._device, turn_on, self._light_method
             )
+            if method != "already_set":
+                self._light_method = method
         elif turn_on:
             await self._service.floodlight_on(self._device)
         else:
